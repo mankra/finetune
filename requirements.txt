@@ -16,4 +16,3 @@ numpy
 scipy
 matplotlib
 easyllm
-fim-python
