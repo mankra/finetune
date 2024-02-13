@@ -1,5 +1,5 @@
 # Finetune
-This is just a modified version of the prepare_dataset and train scripts from pacman100/DHS-LLM-Workshop to finetune a LLM
+This is just a modified version of the prepare_dataset and train scripts from https://github.com/pacman100/DHS-LLM-Workshop to finetune a LLM
 
 `prepare_dataset.py` is used to create dataset and upload it to hugging face. Usually called on a local machine.
 
