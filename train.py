@@ -1,123 +1,90 @@
-# coding=utf-8
-# Copyright 2024 Sourab Mangrulkar. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """
-Continued pre-training/fine-tuning of code LLMs for code autocompletion.
+Fine-Tune StarCoder on code/text dataset
 """
 
+import argparse
 import os
 import random
-import sys
-from typing import Optional
-from dataclasses import dataclass, field
+import subprocess
+import warnings
 
 import numpy as np
 import torch
 from datasets import load_dataset
 from torch.utils.data import IterableDataset
+from torch.utils.data.dataloader import DataLoader
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
     TrainingArguments,
-    HfArgumentParser,
+    logging,
     set_seed,
     BitsAndBytesConfig,
 )
 
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft.tuners.lora import LoraLayer
+
 import fim
 
 
-# Define and parse arguments.
-@dataclass
-class ModelArguments:
-    """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
-    """
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, default="bigcode/starcoderplus")
+    parser.add_argument("--dataset_name", type=str, default="smangrul/hf-stack-v1")
+    parser.add_argument("--subset", type=str, default="data")
+    parser.add_argument("--split", type=str, default="train")
+    parser.add_argument("--size_valid_set", type=int, default=4000)
+    parser.add_argument("--test_size", type=float, default=0.005)
+    parser.add_argument("--streaming", action="store_true")
+    parser.add_argument("--shuffle_buffer", type=int, default=5000)
+    parser.add_argument("--data_column", type=str, default="content")
 
-    model_name_or_path: str = field(
-        metadata={
-            "help": "Path to pretrained model or model identifier from huggingface.co/models"
-        }
-    )
-    lora_alpha: Optional[int] = field(default=16)
-    lora_dropout: Optional[float] = field(default=0.1)
-    lora_r: Optional[int] = field(default=64)
-    lora_target_modules: Optional[str] = field(
-        default="q_proj,k_proj,v_proj,o_proj,down_proj,up_proj,gate_proj",
-        metadata={
-            "help": "comma separated list of target modules to apply LoRA layers to"
-        },
-    )
-    use_nested_quant: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Activate nested quantization for 4bit base models"},
-    )
-    bnb_4bit_compute_dtype: Optional[str] = field(
-        default="float16",
-        metadata={"help": "Compute dtype for 4bit base models"},
-    )
-    bnb_4bit_quant_type: Optional[str] = field(
-        default="nf4",
-        metadata={"help": "Quantization type fp4 or nf4"},
-    )
-    use_flash_attn: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enables Flash attention for training."},
-    )
-    use_peft_lora: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enables PEFT LoRA for training."},
-    )
-    use_8bit_qunatization: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enables loading model in 8bit."},
-    )
-    use_4bit_quantization: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enables loading model in 4bit."},
-    )
-    use_reentrant: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Gradient Checkpointing param. Refer the related docs"},
-    )
-    use_unsloth: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enables UnSloth for training."},
-    )
+    parser.add_argument("--seq_length", type=int, default=8192)
+    parser.add_argument("--max_steps", type=int, default=10000)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--eos_token_id", type=int, default=49152)
 
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine")
+    parser.add_argument("--num_warmup_steps", type=int, default=100)
+    parser.add_argument("--weight_decay", type=float, default=0.05)
 
-@dataclass
-class DataTrainingArguments:
-    dataset_name: Optional[str] = field(
-        default="smangrul/hug_stack",
-        metadata={"help": "The preference dataset to use."},
-    )
-    dataset_text_field: str = field(
-        default="text", metadata={"help": "Dataset field to use as input text."}
-    )
-    max_seq_length: Optional[int] = field(default=4096)
-    test_size: Optional[float] = field(default=0.1)
-    fim_rate: Optional[float] = field(default=0.5)
-    fim_spm_rate: Optional[float] = field(default=0.5)
-    splits: Optional[str] = field(
-        default="train",
-        metadata={"help": "Comma separate list of the splits to use from the dataset."},
-    )
+    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--no_fp16", action="store_false")
+    parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--no_gradient_checkpointing", action="store_false")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser.add_argument("--log_freq", default=1, type=int)
+    parser.add_argument("--eval_freq", default=1000, type=int)
+    parser.add_argument("--save_freq", default=1000, type=int)
+
+    parser.add_argument("--fim_rate", type=float, default=0)
+    parser.add_argument("--fim_spm_rate", type=float, default=0)
+
+    parser.add_argument("--use_peft_lora", action="store_true")
+    parser.add_argument("--lora_r", type=int, default=0)
+    parser.add_argument("--lora_alpha", type=int, default=0)
+    parser.add_argument("--lora_dropout", type=float, default=0)
+    parser.add_argument("--lora_target_modules", type=str, default=None)
+
+    parser.add_argument("--use_flash_attn", action="store_true")
+
+    parser.add_argument("--use_4bit_qunatization", action="store_true")
+    parser.add_argument("--use_nested_quant", action="store_true")
+    parser.add_argument("--bnb_4bit_quant_type", type=str, default="nf4")
+    parser.add_argument("--bnb_4bit_compute_dtype", type=str, default="float16")
+
+    parser.add_argument("--use_8bit_qunatization", action="store_true")
+
+    parser.add_argument("--push_to_hub", action="store_true")
+
+    return parser.parse_args()
 
 
 def chars_token_ratio(dataset, tokenizer, data_column, nb_examples=400):
@@ -159,7 +126,6 @@ class ConstantLengthDataset(IterableDataset):
         fim_rate=0.5,
         fim_spm_rate=0.5,
         seed=0,
-        shuffle=False,
     ):
         self.tokenizer = tokenizer
         self.concat_token_id = tokenizer.eos_token_id
@@ -172,10 +138,8 @@ class ConstantLengthDataset(IterableDataset):
         self.fim_rate = fim_rate
         self.fim_spm_rate = fim_spm_rate
         self.seed = seed
-        self.shuffle = shuffle
 
         (
-            self.bos_token_id,
             self.suffix_tok_id,
             self.prefix_tok_id,
             self.middle_tok_id,
@@ -203,9 +167,7 @@ class ConstantLengthDataset(IterableDataset):
                     else:
                         more_examples = False
                         break
-            tokenized_inputs = self.tokenizer(
-                buffer, truncation=False, add_special_tokens=False
-            )["input_ids"]
+            tokenized_inputs = self.tokenizer(buffer, truncation=False)["input_ids"]
             all_token_ids = []
 
             for tokenized_input in tokenized_inputs:
@@ -221,7 +183,6 @@ class ConstantLengthDataset(IterableDataset):
                         fim_rate=self.fim_rate,
                         fim_spm_rate=self.fim_spm_rate,
                         truncate_or_pad=False,
-                        bos_token_id=self.bos_token_id,
                     )
 
                 all_token_ids.extend(tokenized_input + [self.concat_token_id])
@@ -230,8 +191,7 @@ class ConstantLengthDataset(IterableDataset):
                 input_ids = all_token_ids[i : i + self.seq_length]
                 if len(input_ids) == self.seq_length:
                     examples.append(input_ids)
-            if self.shuffle:
-                random.shuffle(examples)
+            random.shuffle(examples)
             for example in examples:
                 self.current_size += 1
                 yield {
@@ -240,66 +200,74 @@ class ConstantLengthDataset(IterableDataset):
                 }
 
 
-def create_datasets(tokenizer, args, seed):
-    dataset = load_dataset(args.dataset_name, split=args.splits)
-    dataset = dataset.train_test_split(
-        test_size=args.test_size, seed=seed, shuffle=True
+def create_datasets(tokenizer, args):
+    dataset = load_dataset(
+        args.dataset_name,
+        data_dir=args.subset,
+        split=args.split,
+        use_auth_token=True,
+        num_proc=args.num_workers if not args.streaming else None,
+        streaming=args.streaming,
     )
-    train_data = dataset["train"]
-    valid_data = dataset["test"]
-    print(
-        f"Size of the train set: {len(train_data)}. Size of the validation set: {len(valid_data)}"
-    )
-    chars_per_token = chars_token_ratio(train_data, tokenizer, args.dataset_text_field)
+    if args.streaming:
+        print("Loading the dataset in streaming mode")
+        valid_data = dataset.take(args.size_valid_set)
+        train_data = dataset.skip(args.size_valid_set)
+        train_data = train_data.shuffle(buffer_size=args.shuffle_buffer, seed=args.seed)
+    else:
+        dataset = dataset.train_test_split(
+            test_size=args.test_size, seed=args.seed, shuffle=True
+        )
+        train_data = dataset["train"]
+        valid_data = dataset["test"]
+        print(
+            f"Size of the train set: {len(train_data)}. Size of the validation set: {len(valid_data)}"
+        )
+    chars_per_token = chars_token_ratio(train_data, tokenizer, args.data_column)
     print(f"The character to token ratio of the dataset is: {chars_per_token:.2f}")
     train_dataset = ConstantLengthDataset(
         tokenizer,
         train_data,
         infinite=True,
-        seq_length=args.max_seq_length,
+        seq_length=args.seq_length,
         chars_per_token=chars_per_token,
-        content_field=args.dataset_text_field,
+        content_field=args.data_column,
         fim_rate=args.fim_rate,
         fim_spm_rate=args.fim_spm_rate,
-        seed=seed,
-        shuffle=True,
+        seed=args.seed,
     )
     valid_dataset = ConstantLengthDataset(
         tokenizer,
         valid_data,
         infinite=False,
-        seq_length=args.max_seq_length,
+        seq_length=args.seq_length,
         chars_per_token=chars_per_token,
-        content_field=args.dataset_text_field,
+        content_field=args.data_column,
         fim_rate=args.fim_rate,
         fim_spm_rate=args.fim_spm_rate,
-        seed=seed,
+        seed=args.seed,
     )
-    print(f"A sample of valid dataset: {next(iter(valid_dataset))}")
+
     return train_dataset, valid_dataset
 
 
-def create_and_prepare_model(args, data_args, training_args):
+def create_and_prepare_model(args):
     device_map = None
     bnb_config = None
 
     load_in_8bit = args.use_8bit_qunatization
-    load_in_4bit = args.use_4bit_quantization
 
-    if args.use_unsloth:
-        from unsloth import FastLanguageModel
-
-    if args.use_4bit_quantization:
+    if args.use_4bit_qunatization:
         compute_dtype = getattr(torch, args.bnb_4bit_compute_dtype)
 
         bnb_config = BitsAndBytesConfig(
-            load_in_4bit=args.use_4bit_quantization,
+            load_in_4bit=args.use_4bit_qunatization,
             bnb_4bit_quant_type=args.bnb_4bit_quant_type,
             bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=args.use_nested_quant,
         )
 
-        if compute_dtype == torch.float16 and args.use_4bit_quantization:
+        if compute_dtype == torch.float16 and args.use_4bit_qunatization:
             major, _ = torch.cuda.get_device_capability()
             if major >= 8:
                 print("=" * 80)
@@ -308,137 +276,144 @@ def create_and_prepare_model(args, data_args, training_args):
                 )
                 print("=" * 80)
 
-    if args.use_4bit_quantization or args.use_8bit_qunatization:
-        device_map = (
-            int(os.environ.get("LOCAL_RANK", -1))
-            if torch.distributed.is_available() and torch.distributed.is_initialized()
-            else "auto"
-        )  # {"": 0}
+    if args.use_4bit_qunatization or args.use_8bit_qunatization:
+        device_map = {"": 0}
 
-    if args.use_unsloth:
-        # Load model
-        model, _ = FastLanguageModel.from_pretrained(
-            model_name=args.model_name_or_path,
-            max_seq_length=data_args.max_seq_length,
-            dtype=None,
-            load_in_4bit=load_in_4bit,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            load_in_8bit=load_in_8bit,
-            quantization_config=bnb_config,
-            device_map=device_map,
-            trust_remote_code=True,
-            attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        load_in_8bit=load_in_8bit,
+        quantization_config=bnb_config,
+        device_map=device_map,
+        use_cache=not args.no_gradient_checkpointing,
+        trust_remote_code=True,
+        use_flash_attention_2=args.use_flash_attn,
+        torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
+    )
 
     if (
-        (args.use_4bit_quantization or args.use_8bit_qunatization)
-        and args.use_peft_lora
-        and not args.use_unsloth
-    ):
+        args.use_4bit_qunatization or args.use_8bit_qunatization
+    ) and args.use_peft_lora:
         model = prepare_model_for_kbit_training(
-            model,
-            use_gradient_checkpointing=training_args.gradient_checkpointing,
-            gradient_checkpointing_kwargs={"use_reentrant": model_args.use_reentrant},
+            model, use_gradient_checkpointing=args.no_gradient_checkpointing
         )
 
-    if args.use_peft_lora and not args.use_unsloth:
+    if args.use_peft_lora:
         peft_config = LoraConfig(
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
             r=args.lora_r,
             bias="none",
             task_type="CAUSAL_LM",
-            target_modules=args.lora_target_modules.split(",")
-            if args.lora_target_modules != "all-linear"
-            else args.lora_target_modules,
+            target_modules=args.lora_target_modules.split(","),
         )
+
+        if args.no_gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+
         model = get_peft_model(model, peft_config)
-    elif args.use_peft_lora and args.use_unsloth:
-        # Do model patching and add fast LoRA weights
-        model = FastLanguageModel.get_peft_model(
-            model,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            r=args.lora_r,
-            target_modules=args.lora_target_modules.split(",")
-            if args.lora_target_modules != "all-linear"
-            else args.lora_target_modules,
-            use_gradient_checkpointing=training_args.gradient_checkpointing,
-            random_state=training_args.seed,
-            max_seq_length=data_args.max_seq_length,
-        )
+        model.print_trainable_parameters()
     return model
 
 
-def main(model_args, data_args, training_args):
-    # Set seed for reproducibility
-    set_seed(training_args.seed)
+def run_training(args, train_data, val_data):
+    train_data.start_iteration = 0
 
-    # load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
-
-    # load the datasets
-    train_dataset, eval_dataset = create_datasets(
-        tokenizer, data_args, training_args.seed
+    is_deepspeed_peft_enabled = (
+        os.environ.get("ACCELERATE_USE_DEEPSPEED", "False").lower() == "true"
+        and args.use_peft_lora
     )
-    train_dataset.start_iteration = 0
 
-    model = create_and_prepare_model(model_args, data_args, training_args)
-    # gradient ckpt
-    model.config.use_cache = not training_args.gradient_checkpointing
-    training_args.gradient_checkpointing = (
-        training_args.gradient_checkpointing and not model_args.use_unsloth
+    save_strategy = "no" if is_deepspeed_peft_enabled else "steps"
+
+    print(f"Starting main loop")
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        dataloader_drop_last=True,
+        evaluation_strategy="steps",
+        save_strategy=save_strategy,
+        max_steps=args.max_steps,
+        eval_steps=args.eval_freq,
+        save_steps=args.save_freq,
+        logging_steps=args.log_freq,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.num_warmup_steps,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_checkpointing=args.no_gradient_checkpointing,
+        fp16=args.no_fp16,
+        bf16=args.bf16,
+        weight_decay=args.weight_decay,
+        run_name=f"starcoder-copilot",
+        push_to_hub=args.push_to_hub,
+        include_tokens_per_second=True,
     )
-    if training_args.gradient_checkpointing:
-        training_args.gradient_checkpointing_kwargs = {
-            "use_reentrant": model_args.use_reentrant
-        }
 
-    # trainer
+    print("Loading the model")
+    model = create_and_prepare_model(args)
+    print(model)
+    if args.use_peft_lora:
+        model.print_trainable_parameters()
+
     trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        model=model, args=training_args, train_dataset=train_data, eval_dataset=val_data
     )
-    trainer.accelerator.print(f"{trainer.model}")
-    if model_args.use_peft_lora:
-        trainer.model.print_trainable_parameters()
 
-    if model_args.use_peft_lora:
-        # handle PEFT+FSDP case
-        trainer.model.print_trainable_parameters()
-        if getattr(trainer.accelerator.state, "fsdp_plugin", None):
-            from peft.utils.other import fsdp_auto_wrap_policy
+    # post process for faster training when using PEFT + INT4 Quantization
+    if args.use_peft_lora:
+        for name, module in trainer.model.named_modules():
+            if isinstance(module, LoraLayer):
+                if args.bf16:
+                    module = module.to(torch.bfloat16)
+            if "norm" in name:
+                module = module.to(torch.float32)
+            if any(x in name for x in ["lm_head", "embed_tokens", "wte", "wpe"]):
+                if hasattr(module, "weight"):
+                    if args.bf16 and module.weight.dtype == torch.float32:
+                        module = module.to(torch.bfloat16)
 
-            fsdp_plugin = trainer.accelerator.state.fsdp_plugin
-            fsdp_plugin.auto_wrap_policy = fsdp_auto_wrap_policy(trainer.model)
+    print("Training...")
+    trainer.train()
+    if args.use_peft_lora:
+        print("Saving last checkpoint of the model")
+        model.save_pretrained(os.path.join(args.output_dir, "final_checkpoint/"))
 
-    # train
-    checkpoint = None
-    if training_args.resume_from_checkpoint is not None:
-        checkpoint = training_args.resume_from_checkpoint
-    trainer.train(resume_from_checkpoint=checkpoint)
+    if is_deepspeed_peft_enabled:
+        trainer.accelerator.wait_for_everyone()
+        unwrapped_model = trainer.accelerator.unwrap_model(trainer.deepspeed)
+        unwrapped_model.save_pretrained(
+            args.output_dir,
+            state_dict=trainer.accelerator.get_state_dict(trainer.deepspeed),
+        )
+        trainer.accelerator.wait_for_everyone()
 
-    # saving final model
+    # Save model and tokenizer
     if trainer.is_fsdp_enabled:
         trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
-    trainer.save_model()
+
+    if args.push_to_hub:
+        trainer.push_to_hub()
+    else:
+        trainer.save_model(args.output_dir)
+    trainer.accelerator.print(f"Model saved to {args.output_dir}")
+
+    if args.push_to_hub:
+        trainer.model.push_to_hub(args.output_dir)
+
+
+def main(args):
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path, use_auth_token=True, trust_remote_code=True
+    )
+
+    train_dataset, eval_dataset = create_datasets(tokenizer, args)
+
+    run_training(args, train_dataset, eval_dataset)
 
 
 if __name__ == "__main__":
-    parser = HfArgumentParser(
-        (ModelArguments, DataTrainingArguments, TrainingArguments)
-    )
-    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(
-            json_file=os.path.abspath(sys.argv[1])
-        )
-    else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    main(model_args, data_args, training_args)
+    args = get_args()
+    set_seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+    main(args)
