@@ -394,12 +394,14 @@ def run_training(args, train_data, val_data):
 
     if args.push_to_hub:
         trainer.push_to_hub()
+        trainer.accelerator.print(f"Pushed to hub.")
     else:
         trainer.save_model(args.output_dir)
-    trainer.accelerator.print(f"Model saved to {args.output_dir}")
+        trainer.accelerator.print(f"Model saved to {args.output_dir}")
 
     if args.push_to_hub:
         trainer.model.push_to_hub(args.output_dir)
+        trainer.accelerator.print(f"Model pushed to hub.")
 
 
 def main(args):
